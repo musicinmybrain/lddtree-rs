@@ -130,7 +130,7 @@ impl DependencyAnalyzer {
         let dep_tree = match Object::parse(&bytes)? {
             Object::Elf(elf) => self.analyze_dylib(path, elf)?,
             Object::Mach(mach) => match mach {
-                Mach::Fat(_) => todo!(),
+                Mach::Fat(_) => return Err(Error::UnsupportedBinary),
                 Mach::Binary(macho) => self.analyze_dylib(path, macho)?,
             },
             Object::PE(pe) => self.analyze_dylib(path, pe)?,
