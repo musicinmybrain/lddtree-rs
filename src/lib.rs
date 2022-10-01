@@ -7,10 +7,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use fs_err as fs;
-use goblin::elf::{
-    header::{EI_OSABI, ELFOSABI_GNU, ELFOSABI_NONE},
-    Elf,
-};
+use goblin::mach::Mach;
+use goblin::Object;
 
 mod elf;
 mod errors;
@@ -62,6 +60,8 @@ trait InspectDylib {
     fn libraries(&self) -> &[&str];
     /// The binary’s program interpreter (e.g., dynamic linker).
     fn interpreter(&self) -> Option<&str>;
+    /// See if two dynamic libraries are compatible.
+    fn compatible(&self, other: &Object) -> bool;
 }
 
 /// Library dependency analyzer
@@ -126,11 +126,25 @@ impl DependencyAnalyzer {
         self.load_ld_paths(path)?;
 
         let bytes = fs::read(path)?;
-        let elf = Elf::parse(&bytes)?;
+        let dep_tree = match Object::parse(&bytes)? {
+            Object::Elf(elf) => self.analyze_dylib(path, elf)?,
+            Object::Mach(mach) => match mach {
+                Mach::Fat(_) => todo!(),
+                Mach::Binary(macho) => self.analyze_dylib(path, macho)?,
+            },
+            _ => return Err(Error::UnsupportedBinary),
+        };
+        Ok(dep_tree)
+    }
 
-        let rpaths = self.read_rpath(&elf, path)?;
+    fn analyze_dylib(
+        &mut self,
+        path: &Path,
+        dylib: impl InspectDylib,
+    ) -> Result<DependencyTree, Error> {
+        let rpaths = self.read_rpath(&dylib, path)?;
 
-        let needed: Vec<String> = elf.libraries().iter().map(ToString::to_string).collect();
+        let needed: Vec<String> = dylib.libraries().iter().map(ToString::to_string).collect();
         let mut libraries = HashMap::new();
 
         let mut stack = needed.clone();
@@ -138,12 +152,12 @@ impl DependencyAnalyzer {
             if libraries.contains_key(&lib_name) {
                 continue;
             }
-            let library = self.find_library(&elf, &lib_name)?;
+            let library = self.find_library(&dylib, &lib_name)?;
             libraries.insert(lib_name, library.clone());
             stack.extend(library.needed);
         }
 
-        let interpreter = elf.interpreter().map(|interp| interp.to_string());
+        let interpreter = dylib.interpreter().map(|interp| interp.to_string());
         if let Some(ref interp) = interpreter {
             if !libraries.contains_key(interp) {
                 let interp_path = self.root.join(interp.strip_prefix('/').unwrap_or(interp));
@@ -251,7 +265,7 @@ impl DependencyAnalyzer {
     }
 
     /// Try to locate a `lib_name` that is compatible to `dylib`
-    fn find_library(&self, dylib: &Elf, lib_name: &str) -> Result<Library, Error> {
+    fn find_library(&self, dylib: &impl InspectDylib, lib_name: &str) -> Result<Library, Error> {
         for lib_path in self
             .rpaths
             .iter()
@@ -271,10 +285,33 @@ impl DependencyAnalyzer {
             // FIXME: readlink to get real path
             if lib_path.exists() {
                 let bytes = fs::read(&lib_path)?;
-                if let Ok(lib_elf) = Elf::parse(&bytes) {
-                    if compatible_elfs(dylib, &lib_elf) {
-                        let needed = lib_elf.libraries.iter().map(ToString::to_string).collect();
-                        let rpath = self.read_rpath(&lib_elf, &lib_path)?;
+                if let Ok(obj) = Object::parse(&bytes) {
+                    if let Some((rpath, needed)) = match obj {
+                        Object::Elf(ref elf) => {
+                            if dylib.compatible(&obj) {
+                                Some((
+                                    self.read_rpath(elf, &lib_path)?,
+                                    elf.libraries().iter().map(ToString::to_string).collect(),
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        Object::Mach(ref mach) => match mach {
+                            Mach::Fat(_) => None,
+                            Mach::Binary(ref macho) => {
+                                if dylib.compatible(&obj) {
+                                    Some((
+                                        self.read_rpath(macho, &lib_path)?,
+                                        macho.libraries().iter().map(ToString::to_string).collect(),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
+                        },
+                        _ => None,
+                    } {
                         return Ok(Library {
                             name: lib_name.to_string(),
                             path: lib_path.to_path_buf(),
@@ -305,33 +342,4 @@ fn find_musl_libc() -> Result<Option<PathBuf>, Error> {
         Some(Ok(path)) => Ok(Some(path)),
         _ => Ok(None),
     }
-}
-
-/// See if two ELFs are compatible
-///
-/// This compares the aspects of the ELF to see if they're compatible:
-/// bit size, endianness, machine type, and operating system.
-fn compatible_elfs(elf1: &Elf, elf2: &Elf) -> bool {
-    if elf1.is_64 != elf2.is_64 {
-        return false;
-    }
-    if elf1.little_endian != elf2.little_endian {
-        return false;
-    }
-    if elf1.header.e_machine != elf2.header.e_machine {
-        return false;
-    }
-    let compatible_osabis = &[
-        ELFOSABI_NONE, // ELFOSABI_NONE / ELFOSABI_SYSV
-        ELFOSABI_GNU,  // ELFOSABI_GNU / ELFOSABI_LINUX
-    ];
-    let osabi1 = elf1.header.e_ident[EI_OSABI];
-    let osabi2 = elf2.header.e_ident[EI_OSABI];
-    if osabi1 != osabi2
-        && !compatible_osabis.contains(&osabi1)
-        && !compatible_osabis.contains(&osabi2)
-    {
-        return false;
-    }
-    true
 }
